@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -67,39 +69,49 @@ func handleBroadcast(n *maelstrom.Node, c *Caster) func(maelstrom.Message) error
 
 		firstTime := c.Push(body.Message)
 
-		// gossip on new message?
-		if firstTime {
-			// Fire and forget, gossip on every change.
-			// Will be slow (redundant), and has no retries.
-			for _, nbr := range c.nbrs { // FIXME: Race
-				gossip := broadcastBody{
-					MessageBody: maelstrom.MessageBody{
-						Type: "broadcast",
-					},
-					Message: body.Message,
-				}
-				err := n.Send(nbr, gossip)
-				if err != nil {
-					return fmt.Errorf("gossip to %q with %v: %w", nbr, gossip, err)
-				}
-			}
-			// If we see that a nbr accepts our gossip, we know they have the message.
-			// If node ID's are unique, we wouldn't have to send that msg to that nbr again.
-			// We we need to retry the gossip?
-		}
-
 		reply := maelstrom.MessageBody{
 			Type:      "broadcast_ok",
 			InReplyTo: body.MsgID,
 			MsgID:     body.MsgID,
 		}
-		return n.Send(msg.Src, reply)
-	}
-}
+		err := n.Send(msg.Src, reply)
+		if err != nil {
+			return fmt.Errorf("send: %w", err)
+		}
 
-func handleBroadcastOK(n *maelstrom.Node, c *Caster) func(maelstrom.Message) error {
-	return func(msg maelstrom.Message) error {
-		return nil // Silently ack.
+		// gossip on new message?
+		if !firstTime {
+			return nil
+		}
+		// Fire and forget, gossip on every change.
+		// Will be slow (redundant), and has no retries.
+		for _, nbr := range c.nbrs { // FIXME: Race
+			gossip := broadcastBody{
+				MessageBody: maelstrom.MessageBody{
+					Type: "broadcast",
+				},
+				Message: body.Message,
+			}
+
+			go func(nbr string) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				for ctx.Err() == nil {
+					err := n.RPC(nbr, gossip, func(msg maelstrom.Message) error {
+						cancel()
+						return nil
+					})
+					if err != nil {
+						cancel()
+						fmt.Fprintf(os.Stderr, "gossip rpc to %q with %v: %s", nbr, gossip, err)
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+			}(nbr)
+		}
+
+		return nil
 	}
 }
 
@@ -165,7 +177,6 @@ func main() {
 	n := maelstrom.NewNode()
 
 	n.Handle("broadcast", handleBroadcast(n, c))
-	n.Handle("broadcast_ok", handleBroadcastOK(n, c))
 	n.Handle("read", handleRead(n, c))
 	n.Handle("topology", handleTopology(n, c))
 
