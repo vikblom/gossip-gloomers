@@ -79,13 +79,16 @@ func handleBroadcast(n *maelstrom.Node, c *Caster) func(maelstrom.Message) error
 			return fmt.Errorf("send: %w", err)
 		}
 
-		// gossip on new message?
+		// Skip gossip if we have done it before.
 		if !firstTime {
 			return nil
 		}
-		// Fire and forget, gossip on every change.
-		// Will be slow (redundant), and has no retries.
+
+		// Gossip, with retries until a resposne comes back.
 		for _, nbr := range c.nbrs { // FIXME: Race
+			if nbr == msg.Src {
+				continue
+			}
 			gossip := broadcastBody{
 				MessageBody: maelstrom.MessageBody{
 					Type: "broadcast",
@@ -106,7 +109,8 @@ func handleBroadcast(n *maelstrom.Node, c *Caster) func(maelstrom.Message) error
 						cancel()
 						fmt.Fprintf(os.Stderr, "gossip rpc to %q with %v: %s", nbr, gossip, err)
 					}
-					time.Sleep(100 * time.Millisecond)
+					// 1.5x the expected rountrip latency.
+					time.Sleep(300 * time.Millisecond)
 				}
 			}(nbr)
 		}
@@ -159,8 +163,11 @@ func handleTopology(n *maelstrom.Node, c *Caster) func(maelstrom.Message) error 
 		// No need to gossip on topology changes?
 		nbrs, ok := body.Topology[n.ID()]
 		if ok {
-			fmt.Fprintf(os.Stderr, "nbrs are: %v\n", nbrs)
+			fmt.Fprintf(os.Stderr, "nbrs of %q are: %v\n", n.ID(), nbrs)
 		}
+
+		// Use --topology tree4 for a spanning tree.
+		// Scales like log(n) instead of sqrt(n).
 		c.Nbrs(nbrs)
 
 		reply := maelstrom.MessageBody{
