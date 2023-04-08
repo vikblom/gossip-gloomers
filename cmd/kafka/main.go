@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
-	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+	"golang.org/x/exp/slices"
 )
 
 type Msg struct {
@@ -13,31 +15,39 @@ type Msg struct {
 	Content int
 }
 
-func (m Msg) MarshalJSON() ([]byte, error) {
+func (m *Msg) MarshalJSON() ([]byte, error) {
 	return json.Marshal([]int{m.Offset, m.Content})
+}
+
+func (m *Msg) UnmarshalJSON(bs []byte) error {
+	var arr []int
+	err := json.Unmarshal(bs, &arr)
+	if err != nil {
+		return err
+	}
+	if len(arr) != 2 {
+		return fmt.Errorf("expected 2 ints but got: %v", arr)
+	}
+	m.Offset = arr[0]
+	m.Content = arr[1]
+	return nil
 }
 
 type Server struct {
 	n *maelstrom.Node
 
-	// offsets[k]v has the next integer v for the queue k.
-	offsets   map[string]int
-	muOffsets sync.Mutex
-
-	logs   map[string][]Msg
-	muLogs sync.Mutex
-
-	committed   map[string]int
-	muCommitted sync.Mutex
+	// Linear KV store.
+	// "o-key" offsets  (int)
+	// "l-key" logs     ([]Msg)
+	// "c-key" comitted (int)
+	kv *maelstrom.KV
 }
 
-func New(n *maelstrom.Node) *Server {
+func New(n *maelstrom.Node, kv *maelstrom.KV) *Server {
 
 	s := &Server{
-		n:         n,
-		offsets:   map[string]int{},
-		logs:      map[string][]Msg{},
-		committed: map[string]int{},
+		n:  n,
+		kv: kv,
 	}
 
 	s.n.Handle("send", s.handleSend())
@@ -52,52 +62,164 @@ func (s *Server) Run() error {
 	return s.n.Run()
 }
 
-func (s *Server) nextOffset(key string) int {
-	s.muOffsets.Lock()
-	defer s.muOffsets.Unlock()
+func (s *Server) currentOffset(key string) (int, error) {
+	key = "o-" + key
+	for {
+		v, err := s.kv.ReadInt(context.Background(), key)
+		if merr, ok := err.(*maelstrom.RPCError); ok {
+			if merr.Code == maelstrom.KeyDoesNotExist {
+				return 0, nil
+			}
+		}
+		if err != nil {
+			return 0, fmt.Errorf("kv read int %q: %w", key, err)
+		}
 
-	v := s.offsets[key]
-	s.offsets[key] = v + 1
-	return v
+		err = s.kv.CompareAndSwap(context.Background(), key, v, v, true)
+		if merr, ok := err.(*maelstrom.RPCError); ok {
+			if merr.Code == maelstrom.PreconditionFailed {
+				continue // Try again.
+			}
+		}
+		if err != nil {
+			return 0, fmt.Errorf("kv cas %q: %w", key, err)
+		}
+		return v, nil
+	}
 }
 
-func (s *Server) store(key string, msg int) int {
-	offset := s.nextOffset(key)
+func (s *Server) nextOffset(key string) (int, error) {
+	key = "o-" + key
+	for {
+		v, err := s.kv.ReadInt(context.Background(), key)
+		if merr, ok := err.(*maelstrom.RPCError); ok {
+			if merr.Code == maelstrom.KeyDoesNotExist {
+				v = 0
+				err = nil
+			}
+		}
+		if err != nil {
+			return 0, fmt.Errorf("kv read int %q: %w", key, err)
+		}
 
-	s.muLogs.Lock()
-	defer s.muLogs.Unlock()
-	log := s.logs[key]
-	log = append(log, Msg{Offset: offset, Content: msg})
-	s.logs[key] = log
-
-	return offset
+		err = s.kv.CompareAndSwap(context.Background(), key, v, v+1, true)
+		if merr, ok := err.(*maelstrom.RPCError); ok {
+			if merr.Code == maelstrom.PreconditionFailed {
+				continue // Try again.
+			}
+		}
+		if err != nil {
+			return 0, fmt.Errorf("kv cas %q: %w", key, err)
+		}
+		return v, nil
+	}
 }
 
-func (s *Server) retrieve(key string, offset int) []Msg {
-	s.muLogs.Lock()
-	defer s.muLogs.Unlock()
-	log := s.logs[key]
+func (s *Server) store(key string, msg int) (int, error) {
+	offset, err := s.nextOffset(key)
+	if err != nil {
+		return 0, fmt.Errorf("next offset: %w", err)
+	}
+
+	key = "l-" + key
+	for {
+		var before []Msg
+		err := s.kv.ReadInto(context.Background(), key, &before)
+		if merr, ok := err.(*maelstrom.RPCError); ok {
+			if merr.Code == maelstrom.KeyDoesNotExist {
+				err = nil
+			}
+		}
+		if err != nil {
+			return 0, fmt.Errorf("kv read into %q: %w", key, err)
+		}
+
+		after := append(before, Msg{Offset: offset, Content: msg})
+		// slices.SortFunc(after, func(a, b Msg) bool {
+		// 	return a.Offset < b.Offset
+		// })
+
+		err = s.kv.CompareAndSwap(context.Background(), key, before, after, true)
+		if merr, ok := err.(*maelstrom.RPCError); ok {
+			if merr.Code == maelstrom.PreconditionFailed {
+				continue // Try again.
+			}
+		}
+		if err != nil {
+			return 0, fmt.Errorf("kv cas %q: %w", key, err)
+		}
+		return offset, nil
+	}
+}
+
+func (s *Server) retrieve(key string, offset int) ([]Msg, error) {
+
+	// "send" will store logs before returning the offset.
+	// This guarantees we will read any log which has been sent by a client
+	// before calling "poll".
+	// But a "send" could grab some offset n, and then work on storing
+	// that to the log, while at the same time, another "send" grabs n+1
+	// and stores that successfully.
+	// We need to detect this by looking at the current context
+	// and make sure we read matching state.
+	totalOffsets, err := s.currentOffset(key)
+	if err != nil {
+		return nil, fmt.Errorf("current offset: %w", err)
+	}
+	if totalOffsets == 0 {
+		return []Msg{}, nil
+	}
+
+	key = "l-" + key
+
+	var log []Msg
+	for len(log) < totalOffsets {
+		err := s.kv.ReadInto(context.Background(), key, &log)
+		if merr, ok := err.(*maelstrom.RPCError); ok {
+			if merr.Code == maelstrom.KeyDoesNotExist {
+				return []Msg{}, nil
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("kv read into %q: %w", key, err)
+		}
+	}
+
+	slices.SortFunc(log, func(a, b Msg) bool {
+		return a.Offset < b.Offset
+	})
 
 	for i, m := range log {
 		if offset <= m.Offset {
 			// Re-slice, since we only append, should be fine.
-			return log[i:]
+			return log[i:], nil
 		}
 	}
-	return []Msg{}
+	return []Msg{}, nil
 }
 
-func (s *Server) commit(key string, offset int) {
-	s.muCommitted.Lock()
-	defer s.muCommitted.Unlock()
-	s.committed[key] = offset // FIXME: Fail if going back?
+func (s *Server) commit(key string, offset int) error {
+	key = "c-" + key
+	// FIXME: Do we need to check that it's higher?
+	err := s.kv.Write(context.Background(), key, offset)
+	if err != nil {
+		return fmt.Errorf("kv write %q: %w", key, err)
+	}
+	return nil
 }
 
-func (s *Server) getCommitted(key string) (int, bool) {
-	s.muCommitted.Lock()
-	defer s.muCommitted.Unlock()
-	v, ok := s.committed[key]
-	return v, ok
+func (s *Server) getCommitted(key string) (int, bool, error) {
+	key = "c-" + key
+	v, err := s.kv.ReadInt(context.Background(), key)
+	if merr, ok := err.(*maelstrom.RPCError); ok {
+		if merr.Code == maelstrom.KeyDoesNotExist {
+			return 0, false, nil
+		}
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("kv read %q: %w", key, err)
+	}
+	return v, true, nil
 }
 
 func (s *Server) handleSend() func(maelstrom.Message) error {
@@ -118,7 +240,10 @@ func (s *Server) handleSend() func(maelstrom.Message) error {
 			return err
 		}
 
-		offset := s.store(body.Key, body.Msg)
+		offset, err := s.store(body.Key, body.Msg)
+		if err != nil {
+			return fmt.Errorf("store %q:%v: %w", body.Key, body.Msg, err)
+		}
 
 		reply := sendResponse{
 			MessageBody: maelstrom.MessageBody{
@@ -149,9 +274,13 @@ func (s *Server) handlePoll() func(maelstrom.Message) error {
 			return err
 		}
 
+		var err error
 		out := map[string][]Msg{}
 		for key, offset := range body.Offsets {
-			out[key] = s.retrieve(key, offset)
+			out[key], err = s.retrieve(key, offset)
+			if err != nil {
+				return fmt.Errorf("retrieve: %w", err)
+			}
 		}
 
 		reply := pollResponse{
@@ -179,7 +308,10 @@ func (s *Server) handleCommit() func(maelstrom.Message) error {
 		}
 
 		for key, offset := range body.Offsets {
-			s.commit(key, offset)
+			err := s.commit(key, offset)
+			if err != nil {
+				return fmt.Errorf("commit: %w", err)
+			}
 		}
 
 		reply := maelstrom.MessageBody{
@@ -210,7 +342,10 @@ func (s *Server) handleList() func(maelstrom.Message) error {
 
 		out := map[string]int{}
 		for _, key := range body.Keys {
-			offset, ok := s.getCommitted(key)
+			offset, ok, err := s.getCommitted(key)
+			if err != nil {
+				return fmt.Errorf("get committed: %w", err)
+			}
 			if ok {
 				out[key] = offset
 			}
@@ -230,7 +365,8 @@ func (s *Server) handleList() func(maelstrom.Message) error {
 
 func main() {
 	n := maelstrom.NewNode()
-	s := New(n)
+	kv := maelstrom.NewLinKV(n)
+	s := New(n, kv)
 
 	if err := s.Run(); err != nil {
 		log.Fatal(err)
