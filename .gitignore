@@ -17,8 +17,9 @@
 # Maelstrom
 maelstrom/
 store/
-echo
-unique
-broadcast
-broadcast2
-counter
+/echo
+/unique
+/broadcast
+/broadcast2
+/counter
+/kafka
